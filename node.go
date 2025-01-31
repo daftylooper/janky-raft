@@ -28,7 +28,7 @@ type Meta struct {
 	quorum          *Quorum
 	timeout_ch      chan string
 	close_quorum_ch chan string
-	new_leader_ch   chan *Meta //notify probe_beat and timeout routines of new leader
+	new_leader_ch   chan string //notify probe_beat and timeout routines of new leader
 	heart_beat      *HeartBeat
 	term            int
 	voted           bool //represents if node voted this term
@@ -65,13 +65,12 @@ func (q *Quorum) handle_quorum_timeout(close_quorum_ch chan string) {
 	var millis int = 10 // WARNING: right now it decrements 10 milliseconds every 10 ms
 	for {
 		if q.timeout < millis {
+
 			if q.timeout > 0 {
 				time.Sleep(time.Duration(q.timeout) * time.Millisecond)
 			}
-			fmt.Printf("Quorum expired( %s ): Nodes taking too long to respond( are possibly dead ), cannot continue as a cluster\n", q.quorum_type)
-			fmt.Println("Persisting commit log and shutting down...")
 			// TODO: persist commit log and throw panic or gracefully shutdown
-			break
+			return
 		}
 		select {
 		case msg := <-close_quorum_ch:
@@ -80,6 +79,7 @@ func (q *Quorum) handle_quorum_timeout(close_quorum_ch chan string) {
 				fmt.Printf("QUORUM %s: got %d votes with %dms remaining\n", q.quorum_type, q.votes, q.timeout)
 				return
 			}
+		default:
 		}
 		q.timeout -= millis
 		time.Sleep(time.Duration(millis) * time.Millisecond)
@@ -102,9 +102,8 @@ func handle_timeout(meta *Meta) {
 					leader.dead = true
 				}
 
-				meta.state = "CANDIDATE"
 				go conduct_election(meta)
-				break
+				return
 			}
 			// apparently channels are blocking, only read from channel is there is something
 			select {
@@ -155,7 +154,7 @@ func probe_beat(meta *Meta) {
 }
 
 func new_quorum(quorum_type string) *Quorum {
-	return &Quorum{quorum_type: quorum_type, votes: 1, timeout: 10000}
+	return &Quorum{quorum_type: quorum_type, votes: 1, timeout: 1000}
 }
 
 type CommitLog struct {
@@ -199,9 +198,9 @@ func main() {
 	var node_heart_beat *HeartBeat = &HeartBeat{original: init_timeout, timeout: init_timeout}
 	var node_state string = "FOLLOWER"
 
-	meta := Meta{identity: node_identity, value: 0, leader: "node1", state: node_state,
+	meta := Meta{identity: node_identity, value: 0, leader: "", state: node_state,
 		connection_pool: sync.Map{}, commit_log: &CommitLog{}, quorum: nil,
-		timeout_ch: make(chan string), close_quorum_ch: make(chan string), new_leader_ch: make(chan *Meta),
+		timeout_ch: make(chan string), close_quorum_ch: make(chan string), new_leader_ch: make(chan string),
 		heart_beat: node_heart_beat, term: 0}
 
 	init_discover_nodes(&meta, 10) // WARNING: first discover on startup, is blocking, if subsequent connections fail, handle them async?
@@ -317,33 +316,47 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 			}
 		case "CPSYNC":
 			// connection pool sync - the leader sends this, the state every follower should be replicating
-			var alive map[string]bool
-			json.Unmarshal([]byte(parts[0]), alive)
+			if meta.state == "FOLLOWER" {
 
-			for node_id, is_alive := range alive {
-				if v, ok := meta.connection_pool.Load(node_id); ok {
-					val := v.(*Connection)
+				var alive map[string]bool
+				// fmt.Println("RECEIVED ALIVE STR:", parts[1])
+				err := json.Unmarshal([]byte(parts[1]), &alive)
+				if err != nil {
+					fmt.Println("Unmarshall Error:", err)
+				}
 
-					// if connection parity is same, don't do anything
-					if is_alive && !val.dead || !is_alive && val.dead {
-						continue
-					} else {
-						if is_alive {
-							conn, err := get_connection(node_id)
-							if err != nil {
-								fmt.Println("Connection Sync: Couldn't get connection to", node_id)
-								continue
+				// fmt.Printf("ALIVE: %v\n", alive)
+
+				for node_id, is_alive := range alive { // is_alive should be read as "should be alive"
+					// fmt.Printf("CPSYNC: %s is %s\n", node_id, is_alive)
+					if v, ok := meta.connection_pool.Load(node_id); ok {
+						val := v.(*Connection) // what meta(self) thinks of the node connecting to
+
+						// if connection parity is same, don't do anything
+						if is_alive && !val.dead || !is_alive && val.dead {
+							continue
+
+						} else if is_alive && val.dead {
+							if v, ok := meta.connection_pool.Load(node_id); ok {
+								val = v.(*Connection)
+								conn, err := get_connection(val.port)
+								if err != nil {
+									fmt.Println("Connection Sync: Couldn't get connection to", node_id)
+									continue
+								}
+								val.conn = conn
+								val.dead = false
+								val.last_response = 0
 							}
-							val.conn = conn
-							val.dead = false
-							val.last_response = 0
-						} else {
+
+						} else if !is_alive && !val.dead {
 							val.conn = nil
 							val.dead = true
 						}
+
+						meta.connection_pool.Store(node_id, val)
 					}
 
-					meta.connection_pool.Store(node_id, val)
 				}
 			}
 
@@ -363,8 +376,10 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 					}
 					val.conn = conn
 					meta.connection_pool.Store(candidate_identity, val)
+					response(conn, fmt.Sprintf("IMLEADER %s", meta.identity)) // if a follower sends a REQVOTE asks for votes to leader, it willr respdond that it is leader
 				}
 				fmt.Printf("I'm %s and the leader is %s and I triggered CPSYNC\n", meta.identity, meta.leader)
+				fmt.Printf("TRIGGERING CPSYNC: REQVOTE : %s\n", meta.state)
 				trigger_cpsync(meta)
 			}
 			term, _ := strconv.Atoi(candidate_term)
@@ -391,12 +406,17 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 
 			meta.leader = new_leader_identity
 			meta.term += 1
-			meta.state = "FOLLOWER" // if this node became candidate during quorum
 			meta.voted = false
 			meta.heart_beat.timeout = meta.heart_beat.original
-			meta.new_leader_ch <- meta
+			if meta.state == "CANDIDATE" {
+				meta.state = "FOLLOWER" // if this node became candidate during quorum
+				meta.term -= 1          // follower increments its term first and then becoems candidate to start asking for votes.
+			} else {
+				meta.new_leader_ch <- "NEWLEADER" // a candidate exits all go routines which consume any message from new_leader_ch. so it clocks this new_leader_ch, so don't call if it is a candidate
+			}
 			meta.debug_node()
 			go handle_timeout(meta)
+
 		case "RECONCIL":
 			meta.term -= 1
 			meta.state = "FOLLOWER"
@@ -404,6 +424,8 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 			// log reconciliation ??
 		case "LEADER":
 			fmt.Println(meta.leader, meta.identity)
+		case "STATE":
+			fmt.Println(meta.state)
 		default:
 			fmt.Println("Incorrect Command: " + message)
 		}
@@ -444,36 +466,6 @@ func init_discover_nodes(meta *Meta, timeout int) {
 	}
 }
 
-// well not exactly discover peers, but tries to connect to statistically defined nodes
-// TODO: add max retries, if doesn't respond, consider dead( panic and error out that system not stable )
-// TODO: try connecting with nodes in connection_pool whose connections are nil( nodes can connect and disconnect ), but does this make sense? wouldn't raft handle this?
-// func discover_nodes(meta *Meta) {
-// 	ports, _, err := read_config(meta.identity, "config.json")
-// 	if err != nil {
-// 		// error and panic, we print for now
-// 		fmt.Println(err)
-// 	}
-// 	for {
-// 		for node_id, port := range ports {
-// 			// if meta.connection_pool[port] is True, don't try to connect
-// 			if v, ok := meta.connection_pool.Load(node_id); ok {
-// 				node := v.(*Connection)
-// 				if node.dead == true {
-// 					conn, err := get_connection(port)
-// 					if err != nil {
-// 						continue
-// 					}
-// 					node.conn = conn
-// 					node.last_response = 0
-// 					node.dead = false
-// 				}
-// 				meta.connection_pool.Store(node_id, node)
-// 			}
-// 		}
-// 		time.Sleep(time.Second)
-// 	}
-// }
-
 func get_connection(port string) (net.Conn, error) {
 	address := fmt.Sprintf("127.0.0.1:%s", port)
 	fmt.Println("Trying to connect to:", address)
@@ -489,7 +481,7 @@ func handle_connection_pool(meta *Meta) {
 	var millis int = 10
 	if meta.state == "LEADER" {
 		var thresh int = 3
-		go sync_connection_pool(meta)
+		// go sync_connection_pool(meta)
 		for {
 			meta.connection_pool.Range(func(k, v interface{}) bool {
 				node_id := k.(string)
@@ -501,6 +493,8 @@ func handle_connection_pool(meta *Meta) {
 					node.conn = nil
 					node.dead = true
 					meta.connection_pool.Store(node_id, node)
+					fmt.Println("TRIGGERING CPSYNC: HANDLE CONNECTION POOL :", meta.state)
+					trigger_cpsync(meta)
 					fmt.Printf("OPE, %s is dead! - unrespsonsive for - %d beats\n", node_id, node.last_response)
 				}
 				return true
@@ -516,37 +510,37 @@ func handle_connection_pool(meta *Meta) {
 }
 
 // occasionally synchronise connection pool state
-func sync_connection_pool(meta *Meta) {
-	var millis int = 1000
-	for {
-		alive := make(map[string]bool)
-		meta.connection_pool.Range(func(k, v interface{}) bool {
-			node_id := k.(string)
-			node := v.(*Connection)
-			alive[node_id] = node.dead
-			// alive[k.(string)] = v.(*Connection).dead
-			return true
-		})
-		trigger_cpsync(meta)
+// func sync_connection_pool(meta *Meta) {
+// 	var millis int = 10000
+// 	for {
+// 		fmt.Println("TRIGGERING CPSYNC: SYNC CONNECTION POOL :", meta.state)
+// 		trigger_cpsync(meta)
 
-		select {
-		case <-meta.new_leader_ch:
-			return
-		default:
-		}
-		time.Sleep(time.Duration(millis) * time.Millisecond)
-	}
-}
+// 		select {
+// 		case <-meta.new_leader_ch:
+// 			return
+// 		default:
+// 		}
+// 		time.Sleep(time.Duration(millis) * time.Millisecond)
+// 	}
+// }
 
 func trigger_cpsync(meta *Meta) {
-	meta.connection_pool.Range(func(_, v interface{}) bool {
-		alive_str, err := json.Marshal(v)
-		if err != nil {
-			fmt.Println("Error marshalling connection pool: ", err)
-		}
-		broadcast_command(meta, "CPSYNC "+string(alive_str))
+	alive := make(map[string]bool)
+	meta.connection_pool.Range(func(k, v interface{}) bool {
+		node_id := k.(string)
+		node := v.(*Connection)
+		alive[node_id] = node.dead
+
 		return true
 	})
+
+	alive_str, err := json.Marshal(alive)
+	// fmt.Println("ALIVE STR:", alive_str)
+	if err != nil {
+		fmt.Println("Error marshalling connection pool: ", err)
+	}
+	broadcast_command(meta, "CPSYNC "+string(alive_str))
 }
 
 func read_config(identity string, filename string) (map[string]string, int, error) {
@@ -617,6 +611,14 @@ func replicate_log(meta *Meta, message string) {
 	fmt.Println("Inside replciate_log")
 	meta.quorum = new_quorum("LOGREPL")
 	// broadcast command to followers
+
+	meta.connection_pool.Range(func(k, v interface{}) bool {
+		key := k.(string)
+		val := v.(*Connection)
+		fmt.Println("IS CONN GOOD?", key, val.dead, val.last_response, val.conn)
+		return true
+	})
+
 	broadcast_command(meta, message)
 
 	go meta.quorum.handle_quorum_timeout(meta.close_quorum_ch)
@@ -651,6 +653,7 @@ func conduct_election(meta *Meta) {
 	// broadcast for votes
 	meta.quorum = new_quorum("ELECTION")
 	meta.term += 1
+	meta.state = "CANDIDATE"
 	broadcast_command(meta, fmt.Sprintf("REQVOTE %s %d", meta.identity, meta.term))
 	fmt.Printf("asking for votes as a candidate %s\n", meta.identity)
 	// fmt.Printf("current quorum: %s - votes: %d, timeout: %d\n", meta.quorum.quorum_type, meta.quorum.votes, meta.quorum.timeout)
@@ -664,8 +667,8 @@ func conduct_election(meta *Meta) {
 				break
 			}
 			// also check if ack not received after some timeout
+			// TODO: trigger log reconcilation here too
 			if meta.quorum.timeout <= 0 {
-				fmt.Println("Quorum expired before majority")
 				break
 			}
 		}
