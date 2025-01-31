@@ -35,8 +35,8 @@ type Meta struct {
 }
 
 type Connection struct {
-	// mu            sync.Mutex
 	conn          net.Conn
+	port          string
 	last_response int  // how many heartbeats, it last responded
 	dead          bool // is it dead?
 }
@@ -195,7 +195,6 @@ func main() {
 	fmt.Println("Server is listening on port " + listen_port)
 	node_identity := argv[0]
 
-	// TODO: these few lines become irrelevant once leader election is implemented
 	var init_timeout int = (rand.Intn((3000-1500)/10+1) * 10) + 1500 // WARNING: using 150-300ms timeout range because apparently that is what raft uses?
 	var node_heart_beat *HeartBeat = &HeartBeat{original: init_timeout, timeout: init_timeout}
 	var node_state string = "FOLLOWER"
@@ -248,109 +247,166 @@ func handle_connection(meta *Meta, conn net.Conn) {
 // if SET, set value, commit tx
 // if GET, return value
 func interpret_command(meta *Meta, message_buffer []byte) {
-	message := string(message_buffer[:])
-	parts := strings.Fields(message)
-	command := parts[0]
+	buffer_parts := strings.Split(string(message_buffer[:]), ";")
 
-	switch command := command; command {
-	case "GET":
-		fmt.Printf("VALUE> %d\n", meta.value)
-	case "SET":
-		meta.commit_log.staged = message // stage the command no matter what
-		if meta.state == "LEADER" {
-			fmt.Printf("Received From Client: %s\n", message)
-			replicate_log(meta, message)
+	for _, buffer_part := range buffer_parts {
+		if buffer_part == "" {
+			continue
 		}
-		if meta.state == "FOLLOWER" {
-			fmt.Println("Recieved Request From Leader")
-			v, _ := meta.connection_pool.Load(meta.leader)
-			leader := v.(*Connection)
-			response(leader.conn, "VOTE") // TODO: Don't vote if already cast vote for a particular quorum
-			fmt.Println("Ready to commit")
-		}
-	case "PERSIST":
-		fmt.Printf("Trying to interpret message%s\n", message)
-		meta.commit_log.write_log()
-	case "VOTE":
-		// as long as quorum is not closed. it is assured that the quorum will not close until it majority is reached or majority is reached
-		if meta.quorum != nil {
-			// two cases, if node is candidate or leader
+		message := string(buffer_part)
+		parts := strings.Fields(message)
+		command := parts[0]
+
+		switch command := command; command {
+		case "GET":
+			fmt.Printf("VALUE> %d\n", meta.value)
+		case "SET":
+			meta.commit_log.staged = message // stage the command no matter what
 			if meta.state == "LEADER" {
-				meta.quorum.votes += 1
+				fmt.Printf("Received From Client: %s\n", message)
+				replicate_log(meta, message)
 			}
-			if meta.state == "CANDIDATE" {
-				fmt.Println("received vote!")
-				meta.quorum.votes += 1
+			if meta.state == "FOLLOWER" {
+				fmt.Println("Recieved Request From Leader")
+				v, _ := meta.connection_pool.Load(meta.leader)
+				leader := v.(*Connection)
+				response(leader.conn, "VOTE") // TODO: Don't vote if already cast vote for a particular quorum
+				fmt.Println("Ready to commit")
 			}
-		}
-	case "COMMIT":
-		fmt.Println("Commiting staged value")
-		meta.commit_log.commit(meta)
-	case "HEARTBEAT":
-		if meta.state == "FOLLOWER" {
-			meta.timeout_ch <- "ACK"
-			v, _ := meta.connection_pool.Load(meta.leader)
-			leader := v.(*Connection)
-			response(leader.conn, fmt.Sprintf("HBACK %s", meta.identity))
-		}
-	case "HBACK":
-		node_id := parts[1]
-		if v, ok := meta.connection_pool.Load(node_id); ok {
-			follower := v.(*Connection)
+		case "PERSIST":
+			fmt.Printf("Trying to interpret message%s\n", message)
+			meta.commit_log.write_log()
+		case "VOTE":
+			// as long as quorum is not closed. it is assured that the quorum will not close until it majority is reached or majority is reached
+			if meta.quorum != nil {
+				// two cases, if node is candidate or leader
+				if meta.state == "LEADER" {
+					meta.quorum.votes += 1
+				}
+				if meta.state == "CANDIDATE" {
+					fmt.Println("received vote!")
+					meta.quorum.votes += 1
+				}
+			}
+		case "COMMIT":
+			fmt.Println("Commiting staged value")
+			meta.commit_log.commit(meta)
+		case "HEARTBEAT":
+			if meta.state == "FOLLOWER" {
+				meta.timeout_ch <- "ACK"
+				if v, ok := meta.connection_pool.Load(meta.leader); ok {
+					leader := v.(*Connection)
+					response(leader.conn, fmt.Sprintf("HBACK %s", meta.identity))
+				}
+			}
+		case "HBACK":
+			if meta.state == "LEADER" {
+				node_id := parts[1]
+				if v, ok := meta.connection_pool.Load(node_id); ok {
+					follower := v.(*Connection)
 
-			// if a dead nodes comes to life, sends a HBACK	regardless of receiving a HEARTBEAT probe
-			// if the previously thought dead node does this, try to form connection( as a leader to follower )
-			if follower.conn == nil {
-				conn, _ := get_connection(node_id)
-				follower.conn = conn
+					// if a dead nodes comes to life, sends a HBACK	regardless of receiving a HEARTBEAT probe
+					// if the previously thought dead node does this, try to form connection( as a leader to follower )
+					if follower.conn == nil {
+						conn, _ := get_connection(node_id)
+						follower.conn = conn
+					}
+					follower.last_response = 0
+					meta.connection_pool.Store(node_id, follower)
+				}
 			}
-			follower.last_response = 0
-			meta.connection_pool.Store(node_id, follower)
-		}
-	// case "CPSYNC":
-	// 	// connection pool sync
-	case "REQVOTE":
-		candidate_identity := parts[1]
-		candidate_term := parts[2] // what happens if a candidate send a vote to a node with higher term?
-		term, _ := strconv.Atoi(candidate_term)
-		if v, ok := meta.connection_pool.Load(candidate_identity); ok {
-			leader := v.(*Connection)
-			if meta.voted == false && meta.state == "FOLLOWER" && meta.term < term {
-				response(leader.conn, "VOTE")
-				fmt.Printf("%s voted for %s\n", meta.identity, candidate_identity)
-				meta.voted = true
-			} else if meta.term > term {
-				response(leader.conn, "RECONCIL")
-				// TODO: candidate node is stale, do something( log reconciliation )
-			}
-		}
-	case "IMLEADER":
-		new_leader_identity := parts[1]
-		fmt.Printf("Received news that %s is new LEADER\n", new_leader_identity)
-		// set connection to older leader( now killed ) as nil - the same thing is done even when a node times out
-		if v, ok := meta.connection_pool.Load(meta.leader); ok {
-			follower := v.(*Connection)
-			follower.conn = nil
-			meta.connection_pool.Store(meta.leader, follower)
-		}
+		case "CPSYNC":
+			// connection pool sync - the leader sends this, the state every follower should be replicating
+			var alive map[string]bool
+			json.Unmarshal([]byte(parts[0]), alive)
 
-		meta.leader = new_leader_identity
-		meta.term += 1
-		meta.state = "FOLLOWER" // if this node became candidate during quorum
-		meta.voted = false
-		meta.heart_beat.timeout = meta.heart_beat.original
-		meta.new_leader_ch <- meta
-		meta.debug_node()
-		go handle_timeout(meta)
-	case "RECONCIL":
-		meta.term -= 1
-		meta.state = "FOLLOWER"
-		meta.heart_beat.timeout = meta.heart_beat.original
-		// log reconciliation?
-	case "LEADER":
-		fmt.Println(meta.leader, meta.identity)
-	default:
-		fmt.Println("Incorrect Command: " + message)
+			for node_id, is_alive := range alive {
+				if v, ok := meta.connection_pool.Load(node_id); ok {
+					val := v.(*Connection)
+
+					// if connection parity is same, don't do anything
+					if is_alive && !val.dead || !is_alive && val.dead {
+						continue
+					} else {
+						if is_alive {
+							conn, err := get_connection(node_id)
+							if err != nil {
+								fmt.Println("Connection Sync: Couldn't get connection to", node_id)
+								continue
+							}
+							val.conn = conn
+							val.dead = false
+							val.last_response = 0
+						} else {
+							val.conn = nil
+							val.dead = true
+						}
+					}
+
+					meta.connection_pool.Store(node_id, val)
+				}
+			}
+
+		case "REQVOTE":
+			candidate_identity := parts[1]
+			candidate_term := parts[2] // what happens if a candidate send a vote to a node with higher term?
+
+			// if there is a functioning leader and a node asks for votes, it  is clearly a new node trying to join the network which timed out
+			// other followers will not try to form connection since they cannot know for sure if leader is dead or not
+			// leader triggers a CPSYNC
+			if meta.state == "LEADER" {
+				if v, ok := meta.connection_pool.Load(candidate_identity); ok {
+					val := v.(*Connection)
+					conn, err := get_connection(val.port)
+					if err != nil {
+						break
+					}
+					val.conn = conn
+					meta.connection_pool.Store(candidate_identity, val)
+				}
+				fmt.Printf("I'm %s and the leader is %s and I triggered CPSYNC\n", meta.identity, meta.leader)
+				trigger_cpsync(meta)
+			}
+			term, _ := strconv.Atoi(candidate_term)
+			if v, ok := meta.connection_pool.Load(candidate_identity); ok {
+				leader := v.(*Connection)
+				if meta.voted == false && meta.state == "FOLLOWER" && meta.term < term {
+					response(leader.conn, "VOTE")
+					fmt.Printf("%s voted for %s\n", meta.identity, candidate_identity)
+					meta.voted = true
+				} else if meta.term > term {
+					response(leader.conn, "RECONCIL")
+					// TODO: candidate node is stale, do something( log reconciliation )
+				}
+			}
+		case "IMLEADER":
+			new_leader_identity := parts[1]
+			fmt.Printf("Received news that %s is new LEADER\n", new_leader_identity)
+			// set connection to older leader( now killed ) as nil - the same thing is done even when a node times out
+			if v, ok := meta.connection_pool.Load(meta.leader); ok {
+				follower := v.(*Connection)
+				follower.conn = nil
+				meta.connection_pool.Store(meta.leader, follower)
+			}
+
+			meta.leader = new_leader_identity
+			meta.term += 1
+			meta.state = "FOLLOWER" // if this node became candidate during quorum
+			meta.voted = false
+			meta.heart_beat.timeout = meta.heart_beat.original
+			meta.new_leader_ch <- meta
+			meta.debug_node()
+			go handle_timeout(meta)
+		case "RECONCIL":
+			meta.term -= 1
+			meta.state = "FOLLOWER"
+			meta.heart_beat.timeout = meta.heart_beat.original
+			// log reconciliation ??
+		case "LEADER":
+			fmt.Println(meta.leader, meta.identity)
+		default:
+			fmt.Println("Incorrect Command: " + message)
+		}
 	}
 }
 
@@ -379,7 +435,7 @@ func init_discover_nodes(meta *Meta, timeout int) {
 				if err != nil {
 					continue
 				}
-				meta.connection_pool.Store(node_id, &Connection{conn: conn, last_response: 0, dead: false})
+				meta.connection_pool.Store(node_id, &Connection{conn: conn, port: port, last_response: 0, dead: false})
 				connected += 1
 			}
 		}
@@ -433,7 +489,7 @@ func handle_connection_pool(meta *Meta) {
 	var millis int = 10
 	if meta.state == "LEADER" {
 		var thresh int = 3
-		// go sync_connection_pool(meta)
+		go sync_connection_pool(meta)
 		for {
 			meta.connection_pool.Range(func(k, v interface{}) bool {
 				node_id := k.(string)
@@ -471,14 +527,8 @@ func sync_connection_pool(meta *Meta) {
 			// alive[k.(string)] = v.(*Connection).dead
 			return true
 		})
-		meta.connection_pool.Range(func(_, v interface{}) bool {
-			alive_str, err := json.Marshal(v)
-			if err != nil {
-				fmt.Println("Error marshalling connection pool: ", err)
-			}
-			broadcast_command(meta, "CPSYNC "+string(alive_str))
-			return true
-		})
+		trigger_cpsync(meta)
+
 		select {
 		case <-meta.new_leader_ch:
 			return
@@ -486,6 +536,17 @@ func sync_connection_pool(meta *Meta) {
 		}
 		time.Sleep(time.Duration(millis) * time.Millisecond)
 	}
+}
+
+func trigger_cpsync(meta *Meta) {
+	meta.connection_pool.Range(func(_, v interface{}) bool {
+		alive_str, err := json.Marshal(v)
+		if err != nil {
+			fmt.Println("Error marshalling connection pool: ", err)
+		}
+		broadcast_command(meta, "CPSYNC "+string(alive_str))
+		return true
+	})
 }
 
 func read_config(identity string, filename string) (map[string]string, int, error) {
@@ -517,7 +578,7 @@ func read_config(identity string, filename string) (map[string]string, int, erro
 // broadcast command to followers
 func broadcast_command(meta *Meta, command string) {
 	// fmt.Println("Broadcasting command: ", command)
-	to_broadcast := []byte(command)
+	to_broadcast := []byte(command + ";") // add a delimiter
 	meta.connection_pool.Range(func(k, v interface{}) bool {
 		node := v.(*Connection)
 		// fmt.Printf("connection exists? %v\n", conn)
@@ -537,12 +598,14 @@ func broadcast_command(meta *Meta, command string) {
 
 func response(conn net.Conn, message string) {
 	// fmt.Println(message)
-	response := []byte(message)
+	response := []byte(message + ";")
 	if conn == nil {
 		fmt.Println("Invalid connection")
+		return
 	}
 	if response == nil {
 		fmt.Println("Invalid response")
+		return
 	}
 	conn.Write(response) // i don't think it's necessary to retry until success, it either fails or succeeds.
 }
