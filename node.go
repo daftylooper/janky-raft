@@ -97,10 +97,9 @@ func handle_timeout(meta *Meta) {
 				fmt.Println("Leader is down, starting election!")
 				fmt.Printf("My current timeout %d\n", meta.heart_beat.timeout)
 				if v, ok := meta.connection_pool.Load(meta.leader); ok {
-					entry := v.(*Connection)
-					entry.conn = nil
-					entry.dead = true
-
+					leader := v.(*Connection)
+					leader.conn = nil
+					leader.dead = true
 				}
 
 				meta.state = "CANDIDATE"
@@ -114,7 +113,7 @@ func handle_timeout(meta *Meta) {
 					meta.heart_beat.timeout = meta.heart_beat.original
 				}
 			case <-meta.new_leader_ch:
-				fmt.Println("NEW SIGNAL(): handle_timeout()", meta.identity, meta.heart_beat.timeout)
+				// fmt.Println("NEW SIGNAL(): handle_timeout()", meta.identity, meta.heart_beat.timeout)
 				return
 			default:
 				// No message on the channel; continue
@@ -146,7 +145,7 @@ func probe_beat(meta *Meta) {
 			})
 			select {
 			case <-meta.new_leader_ch:
-				fmt.Println("NEW SIGNAL: probe_beat()")
+				// fmt.Println("NEW SIGNAL: probe_beat()")
 				return
 			default:
 			}
@@ -200,10 +199,6 @@ func main() {
 	var init_timeout int = (rand.Intn((3000-1500)/10+1) * 10) + 1500 // WARNING: using 150-300ms timeout range because apparently that is what raft uses?
 	var node_heart_beat *HeartBeat = &HeartBeat{original: init_timeout, timeout: init_timeout}
 	var node_state string = "FOLLOWER"
-	if node_identity == "node1" {
-		node_state = "LEADER"
-		node_heart_beat = nil
-	}
 
 	meta := Meta{identity: node_identity, value: 0, leader: "node1", state: node_state,
 		connection_pool: sync.Map{}, commit_log: &CommitLog{}, quorum: nil,
@@ -211,13 +206,6 @@ func main() {
 		heart_beat: node_heart_beat, term: 0}
 
 	init_discover_nodes(&meta, 10) // WARNING: first discover on startup, is blocking, if subsequent connections fail, handle them async?
-
-	if meta.state == "LEADER" {
-		fmt.Printf("%s: I'm the leader!\n", meta.identity)
-	}
-	if meta.state == "FOLLOWER" {
-		fmt.Println("calling timeout!")
-	}
 
 	go probe_beat(&meta)             // works only for leader
 	go handle_connection_pool(&meta) // works only for leader
@@ -233,7 +221,7 @@ func main() {
 		}
 
 		go handle_connection(&meta, conn)
-		go discover_nodes(&meta)
+		// go discover_nodes(&meta)
 	}
 }
 
@@ -309,6 +297,9 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 		node_id := parts[1]
 		if v, ok := meta.connection_pool.Load(node_id); ok {
 			follower := v.(*Connection)
+
+			// if a dead nodes comes to life, sends a HBACK	regardless of receiving a HEARTBEAT probe
+			// if the previously thought dead node does this, try to form connection( as a leader to follower )
 			if follower.conn == nil {
 				conn, _ := get_connection(node_id)
 				follower.conn = conn
@@ -400,32 +391,32 @@ func init_discover_nodes(meta *Meta, timeout int) {
 // well not exactly discover peers, but tries to connect to statistically defined nodes
 // TODO: add max retries, if doesn't respond, consider dead( panic and error out that system not stable )
 // TODO: try connecting with nodes in connection_pool whose connections are nil( nodes can connect and disconnect ), but does this make sense? wouldn't raft handle this?
-func discover_nodes(meta *Meta) {
-	ports, _, err := read_config(meta.identity, "config.json")
-	if err != nil {
-		// error and panic, we print for now
-		fmt.Println(err)
-	}
-	for {
-		for node_id, port := range ports {
-			// if meta.connection_pool[port] is True, don't try to connect
-			if v, ok := meta.connection_pool.Load(node_id); ok {
-				node := v.(*Connection)
-				if node.dead == true {
-					conn, err := get_connection(port)
-					if err != nil {
-						continue
-					}
-					node.conn = conn
-					node.last_response = 0
-					node.dead = false
-				}
-				meta.connection_pool.Store(node_id, node)
-			}
-		}
-		time.Sleep(time.Second)
-	}
-}
+// func discover_nodes(meta *Meta) {
+// 	ports, _, err := read_config(meta.identity, "config.json")
+// 	if err != nil {
+// 		// error and panic, we print for now
+// 		fmt.Println(err)
+// 	}
+// 	for {
+// 		for node_id, port := range ports {
+// 			// if meta.connection_pool[port] is True, don't try to connect
+// 			if v, ok := meta.connection_pool.Load(node_id); ok {
+// 				node := v.(*Connection)
+// 				if node.dead == true {
+// 					conn, err := get_connection(port)
+// 					if err != nil {
+// 						continue
+// 					}
+// 					node.conn = conn
+// 					node.last_response = 0
+// 					node.dead = false
+// 				}
+// 				meta.connection_pool.Store(node_id, node)
+// 			}
+// 		}
+// 		time.Sleep(time.Second)
+// 	}
+// }
 
 func get_connection(port string) (net.Conn, error) {
 	address := fmt.Sprintf("127.0.0.1:%s", port)
@@ -448,6 +439,8 @@ func handle_connection_pool(meta *Meta) {
 				node_id := k.(string)
 				node := v.(*Connection)
 				// fmt.Println("C: ", v.dead, v.last_response)
+
+				// if the connection pool still considers a node alive and has crossed the max heartbeat requests
 				if node.dead == false && node.last_response >= thresh {
 					node.conn = nil
 					node.dead = true
@@ -456,6 +449,11 @@ func handle_connection_pool(meta *Meta) {
 				}
 				return true
 			})
+			select {
+			case <-meta.new_leader_ch:
+				return
+			default:
+			}
 			time.Sleep(time.Duration(millis) * time.Millisecond)
 		}
 	}
@@ -481,7 +479,11 @@ func sync_connection_pool(meta *Meta) {
 			broadcast_command(meta, "CPSYNC "+string(alive_str))
 			return true
 		})
-
+		select {
+		case <-meta.new_leader_ch:
+			return
+		default:
+		}
 		time.Sleep(time.Duration(millis) * time.Millisecond)
 	}
 }
@@ -614,6 +616,7 @@ func conduct_election(meta *Meta) {
 			meta.debug_node()
 
 			go probe_beat(meta)
+			go handle_connection_pool(meta)
 			fmt.Println("The new elected leader is: ", meta.identity)
 		}
 	}()
