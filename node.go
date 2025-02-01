@@ -58,6 +58,13 @@ func (meta *Meta) debug_node() {
 	fmt.Printf("leader:%s\n", meta.leader)
 	fmt.Printf("state:%s\n", meta.state)
 	fmt.Printf("term:%d\n", meta.term)
+	fmt.Printf("hearbeat:%d\n", meta.heart_beat.original)
+	meta.connection_pool.Range(func(k, v interface{}) bool {
+		key := k.(string)
+		val := v.(*Connection)
+		fmt.Println("IS CONN GOOD?", key, val.dead, val.last_response, val.conn)
+		return true
+	})
 	fmt.Println("-------------------")
 }
 
@@ -79,7 +86,9 @@ func (q *Quorum) handle_quorum_timeout(close_quorum_ch chan string) {
 				fmt.Printf("QUORUM %s: got %d votes with %dms remaining\n", q.quorum_type, q.votes, q.timeout)
 				return
 			}
+			fmt.Println("B")
 		default:
+			// fmt.Println("C")
 		}
 		q.timeout -= millis
 		time.Sleep(time.Duration(millis) * time.Millisecond)
@@ -319,14 +328,13 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 			if meta.state == "FOLLOWER" {
 
 				var alive map[string]bool
-				// fmt.Println("RECEIVED ALIVE STR:", parts[1])
+				fmt.Println("RECEIVED ALIVE STR:", parts[1])
 				err := json.Unmarshal([]byte(parts[1]), &alive)
 				if err != nil {
 					fmt.Println("Unmarshall Error:", err)
 				}
 
 				// fmt.Printf("ALIVE: %v\n", alive)
-
 				for node_id, is_alive := range alive { // is_alive should be read as "should be alive"
 					// fmt.Printf("CPSYNC: %s is %s\n", node_id, is_alive)
 					if v, ok := meta.connection_pool.Load(node_id); ok {
@@ -337,17 +345,14 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 							continue
 
 						} else if is_alive && val.dead {
-							if v, ok := meta.connection_pool.Load(node_id); ok {
-								val = v.(*Connection)
-								conn, err := get_connection(val.port)
-								if err != nil {
-									fmt.Println("Connection Sync: Couldn't get connection to", node_id)
-									continue
-								}
-								val.conn = conn
-								val.dead = false
-								val.last_response = 0
+							conn, err := get_connection(val.port)
+							if err != nil {
+								fmt.Println("Connection Sync: Couldn't get connection to", node_id)
+								continue
 							}
+							val.conn = conn
+							val.dead = false
+							val.last_response = 0
 
 						} else if !is_alive && !val.dead {
 							val.conn = nil
@@ -375,6 +380,8 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 						break
 					}
 					val.conn = conn
+					val.dead = false
+					val.last_response = 0
 					meta.connection_pool.Store(candidate_identity, val)
 					response(conn, fmt.Sprintf("IMLEADER %s", meta.identity)) // if a follower sends a REQVOTE asks for votes to leader, it willr respdond that it is leader
 				}
@@ -422,10 +429,8 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 			meta.state = "FOLLOWER"
 			meta.heart_beat.timeout = meta.heart_beat.original
 			// log reconciliation ??
-		case "LEADER":
-			fmt.Println(meta.leader, meta.identity)
-		case "STATE":
-			fmt.Println(meta.state)
+		case "NODE":
+			meta.debug_node()
 		default:
 			fmt.Println("Incorrect Command: " + message)
 		}
@@ -530,7 +535,8 @@ func trigger_cpsync(meta *Meta) {
 	meta.connection_pool.Range(func(k, v interface{}) bool {
 		node_id := k.(string)
 		node := v.(*Connection)
-		alive[node_id] = node.dead
+		fmt.Println("MARSHALL CPSYNC:", node_id, node.dead)
+		alive[node_id] = !node.dead
 
 		return true
 	})
@@ -612,13 +618,6 @@ func replicate_log(meta *Meta, message string) {
 	meta.quorum = new_quorum("LOGREPL")
 	// broadcast command to followers
 
-	meta.connection_pool.Range(func(k, v interface{}) bool {
-		key := k.(string)
-		val := v.(*Connection)
-		fmt.Println("IS CONN GOOD?", key, val.dead, val.last_response, val.conn)
-		return true
-	})
-
 	broadcast_command(meta, message)
 
 	go meta.quorum.handle_quorum_timeout(meta.close_quorum_ch)
@@ -669,6 +668,7 @@ func conduct_election(meta *Meta) {
 			// also check if ack not received after some timeout
 			// TODO: trigger log reconcilation here too
 			if meta.quorum.timeout <= 0 {
+				fmt.Println("quorum expired!")
 				break
 			}
 		}

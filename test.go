@@ -1,12 +1,14 @@
-package test
+package main
 
-import "fmt"
+import (
+	"fmt"
+	"math/rand"
+)
 
 func main() {
-	alive := make(map[string]string)
-	conn := make(map[string]string)
-	_, exists := alive["huh"]
-	if exists != true {
-		fmt.Println("Doesn't exist!")
+	for i := 0; i < 10; i++ {
+		var init_timeout int = (rand.Intn((3000-1500)/10+1) * 10) + 1500
+		fmt.Println(init_timeout)
 	}
+
 }
