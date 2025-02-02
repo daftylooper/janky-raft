@@ -23,7 +23,7 @@ type Meta struct {
 	value           int
 	leader          string
 	state           string   // whether node is LEADER, CANDIDATE or FOLLOWER
-	connection_pool sync.Map // map[string]Connection
+	connection_pool sync.Map // map[string]*Connection
 	commit_log      *CommitLog
 	quorum          *Quorum
 	timeout_ch      chan string
@@ -50,6 +50,69 @@ type Quorum struct {
 	quorum_type string //log_replication, election( LOGREPL, ELECTION )
 	votes       int
 	timeout     int
+}
+
+type CommitLog struct {
+	staged     string   // the current uncommited command
+	commits    sync.Map // map[int][]*Log
+	prev_index int
+	prev_term  int
+}
+
+type Log struct {
+	index   int
+	term    int // which term was this commited?
+	command string
+}
+
+func (cl *CommitLog) commit(meta *Meta) {
+	// only if a change is staged, perform commit
+	if cl.staged != "" {
+		parts := strings.Fields(cl.staged)
+		value, _ := strconv.Atoi(parts[1])
+		value, err := meta.apply_command(parts[0], value)
+		if err != nil {
+			fmt.Printf("Error Commiting:", err)
+			return
+		}
+
+		log := &Log{index: cl.prev_index + 1, term: meta.term, command: cl.staged}
+		if _, ok := cl.commits.Load(meta.term); !ok {
+			cl.commits.Store(meta.term, make([]*Log, 0))
+		}
+		val, _ := cl.commits.Load(meta.term)
+		entry := val.([]*Log)
+		entry = append(entry, log)
+		cl.commits.Store(meta.term, entry)
+
+		meta.value = value
+		cl.prev_index += 1
+		cl.staged = ""
+	}
+}
+
+func (cl *CommitLog) write_log() {
+	cl.commits.Range(func(_, v interface{}) bool {
+		val := v.([]*Log)
+		for _, log := range val {
+			fmt.Printf(" [%d]{%d} %s |", log.index, log.term, log.command)
+		}
+		return true
+	})
+}
+
+func (meta *Meta) apply_command(command string, value int) (int, error) {
+	switch command {
+	case "SET":
+		return value, nil
+	case "ADD":
+		return meta.value + value, nil
+	case "SUB":
+		return meta.value - value, nil
+	default:
+	}
+
+	return value, fmt.Errorf("Invalid Command")
 }
 
 func (meta *Meta) debug_node() {
@@ -166,28 +229,6 @@ func new_quorum(quorum_type string) *Quorum {
 	return &Quorum{quorum_type: quorum_type, votes: 1, timeout: 1000}
 }
 
-type CommitLog struct {
-	staged  string // the current uncommited command
-	commits []string
-}
-
-func (cl *CommitLog) commit(meta *Meta) {
-	// only if a change is staged, perform commit
-	if cl.staged != "" {
-		parts := strings.Fields(cl.staged)
-		cl.commits = append(cl.commits, cl.staged)
-		value, _ := strconv.Atoi(parts[1])
-		meta.value = value
-		cl.staged = ""
-	}
-}
-
-func (cl *CommitLog) write_log() {
-	for _, commit := range cl.commits {
-		fmt.Printf("%s;", commit)
-	}
-}
-
 func main() {
 
 	argv := os.Args[1:]
@@ -208,7 +249,7 @@ func main() {
 	var node_state string = "FOLLOWER"
 
 	meta := Meta{identity: node_identity, value: 0, leader: "", state: node_state,
-		connection_pool: sync.Map{}, commit_log: &CommitLog{}, quorum: nil,
+		connection_pool: sync.Map{}, commit_log: &CommitLog{prev_index: 0, prev_term: 0}, quorum: nil,
 		timeout_ch: make(chan string), close_quorum_ch: make(chan string), new_leader_ch: make(chan string),
 		heart_beat: node_heart_beat, term: 0}
 
@@ -268,19 +309,33 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 		switch command := command; command {
 		case "GET":
 			fmt.Printf("VALUE> %d\n", meta.value)
-		case "SET":
-			meta.commit_log.staged = message // stage the command no matter what
+		case "SET", "ADD", "SUB":
+			meta.commit_log.staged = fmt.Sprintf("%s %s", command, parts[1]) // stage the command no matter what
 			if meta.state == "LEADER" {
 				fmt.Printf("Received From Client: %s\n", message)
 				replicate_log(meta, message)
 			}
+
+			// this is for settings values - different to "REQVOTE" which is used exclusively for leader election
 			if meta.state == "FOLLOWER" {
 				fmt.Println("Recieved Request From Leader")
 				v, _ := meta.connection_pool.Load(meta.leader)
 				leader := v.(*Connection)
 				response(leader.conn, "VOTE") // TODO: Don't vote if already cast vote for a particular quorum
 				fmt.Println("Ready to commit")
+
+				// leader_term, _ := strconv.Atoi(parts[2])
+				// if meta.voted == false && meta.state == "FOLLOWER" && meta.term == leader_term {
+				// 	meta.voted = true
+				// }
+				// else if meta.term < leader_term {
+				// 	response(leader.conn, "RECONCIL")
+				// } else if meta.term > leader_term {
+				// 	// if self term is more than the leader term, then don't care
+				// 	break
+				// }
 			}
+
 		case "PERSIST":
 			fmt.Printf("Trying to interpret message%s\n", message)
 			meta.commit_log.write_log()
@@ -389,6 +444,7 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 				fmt.Printf("TRIGGERING CPSYNC: REQVOTE : %s\n", meta.state)
 				trigger_cpsync(meta)
 			}
+
 			term, _ := strconv.Atoi(candidate_term)
 			if v, ok := meta.connection_pool.Load(candidate_identity); ok {
 				leader := v.(*Connection)
@@ -614,11 +670,14 @@ func response(conn net.Conn, message string) {
 func replicate_log(meta *Meta, message string) {
 	// get command from client
 	// start a quorum
-	fmt.Println("Inside replciate_log")
+	fmt.Println("Inside replicate_log")
 	meta.quorum = new_quorum("LOGREPL")
 	// broadcast command to followers
 
-	broadcast_command(meta, message)
+	// WARNING: technically, this should be sending an AppendEntries RPC, but we're doing something similar
+	// message here is technically entries[], but there is never more than one command
+	broadcast_command(meta, fmt.Sprintf("%s %d %d %d", message, meta.term, meta.commit_log.prev_index, meta.commit_log.prev_term))
+	// broadcast_command(meta, message)
 
 	go meta.quorum.handle_quorum_timeout(meta.close_quorum_ch)
 	go manage_logrepl_votes(meta)
