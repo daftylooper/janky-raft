@@ -53,8 +53,8 @@ type Quorum struct {
 }
 
 type CommitLog struct {
-	staged     string   // the current uncommited command
-	commits    sync.Map // map[int][]*Log
+	staged     string // the current uncommited command
+	commits    []*Log
 	prev_index int
 	prev_term  int
 }
@@ -77,14 +77,7 @@ func (cl *CommitLog) commit(meta *Meta) {
 		}
 
 		log := &Log{index: cl.prev_index + 1, term: meta.term, command: cl.staged}
-		if _, ok := cl.commits.Load(meta.term); !ok {
-			cl.commits.Store(meta.term, make([]*Log, 0))
-		}
-		val, _ := cl.commits.Load(meta.term)
-		entry := val.([]*Log)
-		entry = append(entry, log)
-		cl.commits.Store(meta.term, entry)
-
+		cl.commits = append(cl.commits, log)
 		meta.value = value
 		cl.prev_index += 1
 		cl.staged = ""
@@ -92,13 +85,10 @@ func (cl *CommitLog) commit(meta *Meta) {
 }
 
 func (cl *CommitLog) write_log() {
-	cl.commits.Range(func(_, v interface{}) bool {
-		val := v.([]*Log)
-		for _, log := range val {
-			fmt.Printf(" [%d]{%d} %s |", log.index, log.term, log.command)
-		}
-		return true
-	})
+	for _, v := range cl.commits {
+		fmt.Printf("{T:%d} {I:%d} %s", v.index, v.term, v.command)
+	}
+	fmt.Print("\n")
 }
 
 func (meta *Meta) apply_command(command string, value int) (int, error) {
@@ -244,7 +234,8 @@ func main() {
 	fmt.Println("Server is listening on port " + listen_port)
 	node_identity := argv[0]
 
-	var init_timeout int = (rand.Intn((3000-1500)/10+1) * 10) + 1500 // WARNING: using 150-300ms timeout range because apparently that is what raft uses?
+	// WARNING / TODO: the idea is to use a longer heartbeat on startup once, subsequent heartbeats will be throttled down to 150-300ms
+	var init_timeout int = (rand.Intn((3000-1500)/10+1) * 10) + 1500
 	var node_heart_beat *HeartBeat = &HeartBeat{original: init_timeout, timeout: init_timeout}
 	var node_state string = "FOLLOWER"
 
@@ -310,30 +301,32 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 		case "GET":
 			fmt.Printf("VALUE> %d\n", meta.value)
 		case "SET", "ADD", "SUB":
+			// replicate_log sends command of type - COMMAND value leader_term prevLogIndex prevLogTerm
 			meta.commit_log.staged = fmt.Sprintf("%s %s", command, parts[1]) // stage the command no matter what
 			if meta.state == "LEADER" {
 				fmt.Printf("Received From Client: %s\n", message)
 				replicate_log(meta, message)
 			}
 
-			// this is for settings values - different to "REQVOTE" which is used exclusively for leader election
+			// this is for setting values - different to "REQVOTE" which is used exclusively for leader election
 			if meta.state == "FOLLOWER" {
-				fmt.Println("Recieved Request From Leader")
+				fmt.Println("Received Request From Leader")
 				v, _ := meta.connection_pool.Load(meta.leader)
 				leader := v.(*Connection)
-				response(leader.conn, "VOTE") // TODO: Don't vote if already cast vote for a particular quorum
-				fmt.Println("Ready to commit")
+				leader_term, _ := strconv.Atoi(parts[2])
+				prevLogIndex, _ := strconv.Atoi(parts[3])
+				prevLogTerm, _ := strconv.Atoi(parts[4])
 
-				// leader_term, _ := strconv.Atoi(parts[2])
-				// if meta.voted == false && meta.state == "FOLLOWER" && meta.term == leader_term {
-				// 	meta.voted = true
-				// }
-				// else if meta.term < leader_term {
-				// 	response(leader.conn, "RECONCIL")
-				// } else if meta.term > leader_term {
-				// 	// if self term is more than the leader term, then don't care
-				// 	break
-				// }
+				if prevLogIndex == meta.commit_log.prev_index && prevLogTerm == meta.commit_log.prev_term {
+					if meta.voted == false && leader_term == meta.term {
+						meta.voted = true
+						response(leader.conn, "VOTE")
+						fmt.Println("Ready to commit")
+					}
+				} else {
+					response(leader.conn, fmt.Sprintf("RECONCIL %s %d %d", meta.identity, prevLogIndex, prevLogTerm))
+					fmt.Printf("Detected mismatch in self, informed leader -> Expected: %d, %d Actual: %d, %d\n", prevLogIndex, prevLogTerm, meta.commit_log.prev_index, meta.commit_log.prev_term)
+				}
 			}
 
 		case "PERSIST":
@@ -352,8 +345,11 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 				}
 			}
 		case "COMMIT":
-			fmt.Println("Commiting staged value")
-			meta.commit_log.commit(meta)
+			if meta.voted {
+				fmt.Println("Commiting staged value! voted:", meta.voted)
+				meta.commit_log.commit(meta)
+				meta.voted = false
+			}
 		case "HEARTBEAT":
 			if meta.state == "FOLLOWER" {
 				meta.timeout_ch <- "ACK"
@@ -452,9 +448,6 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 					response(leader.conn, "VOTE")
 					fmt.Printf("%s voted for %s\n", meta.identity, candidate_identity)
 					meta.voted = true
-				} else if meta.term > term {
-					response(leader.conn, "RECONCIL")
-					// TODO: candidate node is stale, do something( log reconciliation )
 				}
 			}
 		case "IMLEADER":
@@ -469,11 +462,13 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 
 			meta.leader = new_leader_identity
 			meta.term += 1
+			meta.commit_log.prev_term = meta.term
 			meta.voted = false
 			meta.heart_beat.timeout = meta.heart_beat.original
 			if meta.state == "CANDIDATE" {
 				meta.state = "FOLLOWER" // if this node became candidate during quorum
 				meta.term -= 1          // follower increments its term first and then becoems candidate to start asking for votes.
+				meta.commit_log.prev_term = meta.term
 			} else {
 				meta.new_leader_ch <- "NEWLEADER" // a candidate exits all go routines which consume any message from new_leader_ch. so it clocks this new_leader_ch, so don't call if it is a candidate
 			}
@@ -481,12 +476,56 @@ func interpret_command(meta *Meta, message_buffer []byte) {
 			go handle_timeout(meta)
 
 		case "RECONCIL":
-			meta.term -= 1
-			meta.state = "FOLLOWER"
-			meta.heart_beat.timeout = meta.heart_beat.original
-			// log reconciliation ??
+			if meta.state == "LEADER" {
+				follower := parts[1]
+				logIndex, _ := strconv.Atoi(parts[2])
+				logIndex -= 1
+				fmt.Println("Decrementing log index!")
+				prevLog := meta.commit_log.commits[logIndex]
+				logSlice := meta.commit_log.commits[logIndex:]
+				fmt.Println("My current LOG: ", meta.commit_log.commits)
+				var logs strings.Builder
+				for _, log := range logSlice {
+					command := strings.Fields(log.command)
+					logs.WriteString(fmt.Sprintf("%s$%s^", command[0], command[1])) // can't use " ", ref - $ - " ", ^ - separator b/w commands
+				}
+				if v, ok := meta.connection_pool.Load(follower); ok {
+					follower := v.(*Connection)
+					fmt.Printf("Decremented and sent logs %d, %d, %s\n", logIndex, prevLog.term, logs.String())
+					response(follower.conn, fmt.Sprintf("RECONCIL %d %d %s", logIndex, prevLog.term, logs.String()))
+				}
+			}
+
+			if meta.state == "FOLLOWER" {
+				prevLogIndex, _ := strconv.Atoi(parts[1])
+				prevLogTerm, _ := strconv.Atoi(parts[2])
+				if v, ok := meta.connection_pool.Load(meta.leader); ok {
+					leader := v.(*Connection)
+					if prevLogIndex != meta.commit_log.prev_index || prevLogTerm != meta.commit_log.prev_term {
+						response(leader.conn, fmt.Sprintf("RECONCIL %s %d %d", meta.identity, prevLogIndex, prevLogTerm)) // indicate mismatch, ask leader to send prev index and term
+						fmt.Printf("Detected mismatch in self, informed leader -> Expected: %d, %d Actual: %d, %d\n", prevLogIndex, prevLogTerm, meta.commit_log.prev_index, meta.commit_log.prev_term)
+					} else {
+						// apply logs from prevLogIndex
+						// TODO: apply/set log term and then commit
+						fmt.Printf("Found point where logs diverged! index: %d, term: %d\n", prevLogIndex, prevLogTerm)
+						meta.commit_log.commits = meta.commit_log.commits[:prevLogIndex]
+						log := parts[3]
+						logs := strings.Split(log, "^")
+						for _, log := range logs {
+							command = strings.Replace(log, "$", " ", 1)
+							meta.commit_log.staged = command
+							meta.commit_log.commit(meta)
+						}
+						meta.commit_log.prev_term = prevLogTerm // index increments iteself in commit(), so it's taken care of
+						fmt.Println("Applied all logs, synced with leader!")
+					}
+				}
+			}
+
 		case "NODE":
 			meta.debug_node()
+		case "LOG":
+			meta.commit_log.write_log()
 		default:
 			fmt.Println("Incorrect Command: " + message)
 		}
@@ -699,8 +738,8 @@ func manage_logrepl_votes(meta *Meta) {
 		}
 	}
 
-	// close the quorum
 	if quorum {
+		// check if followers ready for commit?
 		meta.commit_log.commit(meta)
 		broadcast_command(meta, "COMMIT")
 		meta.close_quorum_ch <- "CLOSE"
@@ -711,6 +750,7 @@ func conduct_election(meta *Meta) {
 	// broadcast for votes
 	meta.quorum = new_quorum("ELECTION")
 	meta.term += 1
+	meta.commit_log.prev_term = meta.term
 	meta.state = "CANDIDATE"
 	broadcast_command(meta, fmt.Sprintf("REQVOTE %s %d", meta.identity, meta.term))
 	fmt.Printf("asking for votes as a candidate %s\n", meta.identity)
@@ -733,7 +773,6 @@ func conduct_election(meta *Meta) {
 		}
 
 		if quorum {
-			meta.commit_log.commit(meta)
 			broadcast_command(meta, fmt.Sprintf("IMLEADER %s", meta.identity))
 			meta.state = "LEADER"
 			meta.leader = meta.identity
