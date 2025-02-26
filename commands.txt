@@ -3,5 +3,3 @@ ADD <value>
 SUB <value>
 GET
 PERSIST
-LOGREPL - log replication - leader sends request to modify value
-VOTE - follower nodes respond with affirmatively by voting
